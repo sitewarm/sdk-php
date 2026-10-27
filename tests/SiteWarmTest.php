@@ -113,7 +113,11 @@ final class SiteWarmTest extends TestCase
             : ['status' => 200, 'body' => '{"id":"s1"}']);
         $c->call('getSite', ['siteId' => 's1']);
         $this->assertCount(3, $t->seen);
-        $this->assertSame([2.0, 2.0], $this->slept);
+        $this->assertCount(2, $this->slept);
+        foreach ($this->slept as $w) {
+            $this->assertGreaterThanOrEqual(2.0, $w); // Retry-After plus up to 25% jitter
+            $this->assertLessThanOrEqual(2.5, $w);
+        }
     }
 
     public function testRetryAfterBeyondCapIsSurfaced(): void

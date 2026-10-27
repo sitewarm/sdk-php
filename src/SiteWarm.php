@@ -16,6 +16,10 @@ use Sitewarm\Sdk\Model\WarmRunCreate;
  */
 final class SiteWarm
 {
+    /** SDK version, sent in the User-Agent (no version is declared in composer.json; this matches the other SDKs' preview marker). */
+    public const VERSION = '0.1.0-preview';
+    public const DEFAULT_USER_AGENT = 'sitewarm-php/' . self::VERSION . ' (+https://github.com/sitewarm/sdk-php)';
+
     public readonly Sites $sites;
     public readonly WarmRuns $warmRuns;
 
@@ -154,13 +158,22 @@ final class SiteWarm
         $headers = [
             'Authorization' => 'Bearer ' . $this->apiKey->reveal(),
             'Accept' => 'application/json, application/problem+json',
-            'User-Agent' => $this->options['userAgent'] ?? 'sitewarm-php',
+            // An empty userAgent keeps the default.
+            'User-Agent' => is_string($this->options['userAgent'] ?? null) && $this->options['userAgent'] !== ''
+                ? $this->options['userAgent']
+                : self::DEFAULT_USER_AGENT,
         ];
         if ($json !== null) {
             $headers['Content-Type'] = 'application/json';
         }
         if ($key !== null) {
             $headers['Idempotency-Key'] = $key;
+        }
+        foreach ($headers as $value) {
+            if (preg_match('/[\x00-\x08\x0a-\x1f\x7f]/', $value) === 1) {
+                // Repeating cannot fix it, and the value may be the key, so it is not echoed.
+                throw new SiteWarmException('malformed request (invalid header value)');
+            }
         }
 
         for ($attempt = 0;; $attempt++) {
@@ -169,12 +182,13 @@ final class SiteWarm
                 $resp = $this->transport->send($method, $url, $headers, $json, $timeout);
             } catch (ConnectionException $e) {
                 // A body that breaks off carries the status: after a 429 nothing was processed, so retry for any method.
-                if (!$last && ($retryAmbiguous || $e->status === 429)) {
+                // Certificate, unknown-host and malformed-request failures are permanent: repeating cannot fix them.
+                if (!$last && ($retryAmbiguous || $e->status === 429) && !$e->permanent) {
                     ($this->sleep)(self::backoff($attempt, $retryBase, $retryMax));
                     continue;
                 }
                 // Rethrown fresh: its trace must not contain the transport frames, whose arguments include the headers.
-                throw new ConnectionException($e->getMessage(), $e->timeout, $e->status);
+                throw new ConnectionException($e->getMessage(), $e->timeout, $e->status, $e->permanent);
             } catch (ResponseTooLargeException $e) {
                 throw new ResponseTooLargeException($e->limit);
             }
@@ -183,18 +197,41 @@ final class SiteWarm
             }
             $status = $resp['status'];
             if ($status >= 200 && $status < 300) {
+                self::assertJson($resp['body'], $status);
                 return $resp;
             }
             $retryAfter = self::parseRetryAfter($resp['headers']['retry-after'] ?? null);
+            $error = self::apiError($status, $resp, $retryAfter);
             $retryable = $status === 429 || ($status >= 500 && $status !== 501 && $retryAmbiguous);
+            // A 409 "conflict" on a keyed POST is the original request still running (a timeout retry racing it).
+            // "idempotency-key-reused" is a caller bug and is never retried.
+            if ($status === 409 && $sendsKey && $error->errorCode === 'conflict') {
+                $retryable = true;
+            }
             if ($retryable && !$last) {
-                $wait = $retryAfter ?? self::backoff($attempt, $retryBase, $retryMax);
-                if ($wait <= $retryMax) { // a longer server-provided wait is surfaced, not ignored
-                    ($this->sleep)($wait);
+                // Never a hot retry on "Retry-After: 0" or a date in the past; jitter spreads clients out.
+                // A server-provided wait longer than the cap is surfaced, not slept.
+                $floored = $retryAfter === null ? null : max($retryAfter, (float) $retryBase);
+                if ($floored === null || $floored <= $retryMax) {
+                    ($this->sleep)($floored === null
+                        ? self::backoff($attempt, $retryBase, $retryMax)
+                        : $floored * (1 + (mt_rand() / mt_getrandmax()) / 4));
                     continue;
                 }
             }
-            throw self::apiError($status, $resp, $retryAfter);
+            throw $error;
+        }
+    }
+
+    /** A 2xx body that is not JSON (an HTML page from a proxy, say) is a typed error that never includes the body. */
+    private static function assertJson(string $body, int $status): void
+    {
+        if ($status === 204 || trim($body) === '') {
+            return;
+        }
+        $valid = function_exists('json_validate') ? json_validate($body) : (json_decode($body) !== null || json_last_error() === JSON_ERROR_NONE);
+        if (!$valid) {
+            throw new DecodeException($status);
         }
     }
 
