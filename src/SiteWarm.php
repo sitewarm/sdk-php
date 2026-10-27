@@ -20,6 +20,8 @@ final class SiteWarm
     public readonly WarmRuns $warmRuns;
 
     private readonly string $baseUrl;
+    /** Held in an object without properties, so var_export, print_r, (array) and var_dump never show the key. */
+    private readonly Secret $apiKey;
     private readonly Transport $transport;
     /** @var callable(float): void */
     private $sleep;
@@ -32,7 +34,7 @@ final class SiteWarm
      *     retryBase and retryMax are seconds; `sleep` and `clock` exist for tests.
      */
     public function __construct(
-        #[\SensitiveParameter] private readonly string $apiKey,
+        #[\SensitiveParameter] string $apiKey,
         string $baseUrl,
         private readonly array $options = [],
     ) {
@@ -40,6 +42,7 @@ final class SiteWarm
         if (preg_match('/^[\x21-\x7e]+$/', $apiKey) !== 1) {
             throw new SiteWarmException('apiKey must be non-empty printable ASCII without whitespace');
         }
+        $this->apiKey = new Secret($apiKey);
         $this->baseUrl = self::normalize($baseUrl);
         $this->transport = $options['transport'] ?? new CurlTransport();
         $this->sleep = $options['sleep'] ?? static function (float $s): void {
@@ -115,6 +118,7 @@ final class SiteWarm
         }
         [$method, $template, $idem] = $op;
         $url = $this->baseUrl . self::expand($template, $path);
+        $query = self::checkedQuery($query);
         $pairs = [];
         foreach ($query as $k => $v) {
             if ($v !== null) {
@@ -137,13 +141,18 @@ final class SiteWarm
         $sendsKey = $idem !== 'none' && $method === 'POST';
         // One key per call, reused by every retry, so a retried POST never starts a second run.
         $key = $sendsKey ? ($idempotencyKey ?? self::uuid()) : null;
-        // 429 = not processed. 5xx and network errors may have been, so retry them only when repeating is safe.
-        $retryAmbiguous = $method !== 'POST' || $sendsKey;
-        $maxRetries = $this->options['maxRetries'] ?? 3;
+        // 429 = not processed. 5xx, network errors and broken bodies may have been, so retry them only when
+        // repeating is safe: GET, HEAD, PUT, OPTIONS, or a POST with an Idempotency-Key. DELETE and PATCH: 429 only.
+        $retryAmbiguous = in_array($method, ['GET', 'HEAD', 'PUT', 'OPTIONS'], true) || $sendsKey;
+        // A negative maxRetries or a timeout <= 0 keeps the default.
+        $configuredRetries = $this->options['maxRetries'] ?? 3;
+        $maxRetries = is_int($configuredRetries) && $configuredRetries >= 0 ? $configuredRetries : 3;
+        $configuredTimeout = $this->options['timeout'] ?? 30.0;
+        $timeout = (is_int($configuredTimeout) || is_float($configuredTimeout)) && $configuredTimeout > 0 ? (float) $configuredTimeout : 30.0;
         $retryBase = $this->options['retryBase'] ?? 0.5;
         $retryMax = $this->options['retryMax'] ?? 30.0;
         $headers = [
-            'Authorization' => 'Bearer ' . $this->apiKey,
+            'Authorization' => 'Bearer ' . $this->apiKey->reveal(),
             'Accept' => 'application/json, application/problem+json',
             'User-Agent' => $this->options['userAgent'] ?? 'sitewarm-php',
         ];
@@ -157,13 +166,20 @@ final class SiteWarm
         for ($attempt = 0;; $attempt++) {
             $last = $attempt >= $maxRetries;
             try {
-                $resp = $this->transport->send($method, $url, $headers, $json, $this->options['timeout'] ?? 30.0);
+                $resp = $this->transport->send($method, $url, $headers, $json, $timeout);
             } catch (ConnectionException $e) {
-                if (!$last && $retryAmbiguous) {
+                // A body that breaks off carries the status: after a 429 nothing was processed, so retry for any method.
+                if (!$last && ($retryAmbiguous || $e->status === 429)) {
                     ($this->sleep)(self::backoff($attempt, $retryBase, $retryMax));
                     continue;
                 }
-                throw $e;
+                // Rethrown fresh: its trace must not contain the transport frames, whose arguments include the headers.
+                throw new ConnectionException($e->getMessage(), $e->timeout, $e->status);
+            } catch (ResponseTooLargeException $e) {
+                throw new ResponseTooLargeException($e->limit);
+            }
+            if (strlen($resp['body']) > Limits::MAX_BODY) {
+                throw new ResponseTooLargeException(Limits::MAX_BODY);
             }
             $status = $resp['status'];
             if ($status >= 200 && $status < 300) {
@@ -214,6 +230,29 @@ final class SiteWarm
         return $at === false ? null : max(0.0, (float) ($at - time()));
     }
 
+    /**
+     * `limit` must be an integer in 1..100 (null, '' or 0 = server default, not sent); invalid values never reach the server.
+     *
+     * @param array<string, string|int|bool|null> $query
+     * @return array<string, string|int|bool|null>
+     */
+    private static function checkedQuery(array $query): array
+    {
+        if (!array_key_exists('limit', $query)) {
+            return $query;
+        }
+        $v = $query['limit'];
+        if ($v === null || $v === '' || $v === 0 || $v === '0') {
+            unset($query['limit']);
+            return $query;
+        }
+        $n = is_int($v) ? $v : (is_string($v) && preg_match('/^\d+$/', $v) === 1 ? (int) $v : null);
+        if ($n === null || $n < 1 || $n > 100) {
+            throw new SiteWarmException('limit must be an integer between 1 and 100');
+        }
+        return $query;
+    }
+
     private static function backoff(int $attempt, float $base, float $max): float
     {
         $ceil = min($max, $base * (2 ** $attempt));
@@ -246,12 +285,14 @@ final class SiteWarm
      * @param array<string, string> $path
      * @param array<string, string|int|bool|null> $query
      * @param class-string|null $type model class to decode items into; null yields associative arrays
+     * @param int $maxPages throws instead of ending silently when this many pages did not reach the end
      * @return \Generator<int, mixed>
      */
-    public function items(string $operationId, array $path = [], array $query = [], ?string $type = null): \Generator
+    public function items(string $operationId, array $path = [], array $query = [], ?string $type = null, int $maxPages = Limits::MAX_PAGES): \Generator
     {
         $cursor = isset($query['cursor']) ? (string) $query['cursor'] : null;
-        for ($pages = 0; $pages < 10_000; $pages++) {
+        $seen = $cursor !== null ? [$cursor => true] : [];
+        for ($pages = 0; $pages < $maxPages; $pages++) {
             $q = $cursor === null ? $query : [...$query, 'cursor' => $cursor];
             $r = $this->exchange($operationId, $path, $q);
             $doc = json_decode($r['body']);
@@ -263,11 +304,13 @@ final class SiteWarm
             if (!($info->has_more ?? false) || $next === null || $next === '') {
                 return;
             }
-            if ($next === $cursor) {
+            if (isset($seen[$next])) {
                 throw new SiteWarmException('pagination cursor did not advance');
             }
+            $seen[$next] = true;
             $cursor = $next;
         }
+        throw new SiteWarmException("pagination stopped after {$maxPages} pages without reaching the end");
     }
 
     /**

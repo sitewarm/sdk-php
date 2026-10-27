@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Sitewarm\Sdk;
 
-/** Sends one HTTP request. Replaceable in tests. Throws {@see ConnectionException} when there is no response. */
+/** Sends one HTTP request. Replaceable in tests. Throws {@see ConnectionException} when there is no complete response and {@see ResponseTooLargeException} for a body over {@see Limits::MAX_BODY}. */
 interface Transport
 {
     /**
      * @param array<string, string> $headers
      * @return array{status: int, headers: array<string, string>, body: string} header names lower-cased
      */
-    public function send(string $method, string $url, array $headers, ?string $body, float $timeout): array;
+    public function send(string $method, string $url, #[\SensitiveParameter] array $headers, ?string $body, float $timeout): array;
 }
